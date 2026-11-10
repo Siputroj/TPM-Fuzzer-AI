@@ -374,7 +374,227 @@ The protobuf schema (`include/proto/tpm_commands.proto`) models 15 distinct TPM 
 
 ---
 
-## 5. Build, Test, and Execution Workflows
+## 5. Advanced Mutation & Cryptographic Architecture: libprotobuf-mutator Deep Dive
+
+### A. libFuzzer & libprotobuf-mutator Integration
+
+The structure-aware fuzzer (`proto-fuzzer`) links Clang's **libFuzzer** engine with Google's **libprotobuf-mutator** through CMake and specialized macro hooks:
+
+```text
+┌────────────────────────────────────────────────────────┐
+│                   libFuzzer Engine                     │
+│  • Drives fuzzing loop & collects Clang code coverage  │
+│  • Manages the corpus queue & evolutionary pruning     │
+└────────────┬──────────────────────────────▲────────────┘
+             │ Calls                         │ Returns
+             │ LLVMFuzzerCustomMutator       │ Mutated Buffer
+             ▼                               │
+┌────────────────────────────────────────────────────────┐
+│             protobuf-mutator-libfuzzer                 │
+│  • Deserializes corpus buffer into Protobuf AST        │
+│  • Performs AST-level mutations (Add, Delete, Copy)    │
+│  • Delegates primitive leaf mutations to libFuzzer     │
+│  • Executes harness post-processors (Normalization)    │
+│  • Re-serializes AST to protobuf wire/text format      │
+└────────────────────────────────────────────────────────┘
+```
+
+1. **Compilation (`CMakeLists.txt`):**
+   `proto-fuzzer` is compiled with Clang's `-fsanitize=fuzzer` and links against the `protobuf-mutator-libfuzzer` target.
+2. **Hook Definition (`src/proto-fuzzer.cc`):**
+   Calling `DEFINE_PROTO_FUZZER(const tpm::TPMCommandSequence& sequence)` registers three symbols libFuzzer detects automatically:
+   * `LLVMFuzzerTestOneInput`: The execution entry point for each test iteration.
+   * `LLVMFuzzerCustomMutator`: Overrides libFuzzer's default raw-byte mutator, routing mutation requests into `protobuf_mutator::libfuzzer::CustomProtoMutator`.
+   * `LLVMFuzzerCustomCrossOver`: Allows libFuzzer to splice subtrees between two protobuf seeds.
+3. **Internal Leaf Mutation Loop (`libfuzzer_mutator.cc`):**
+   When `libprotobuf-mutator` decides to mutate a primitive scalar leaf, it calls back into libFuzzer via `LLVMFuzzerMutate(...)`.
+
+---
+
+### B. Structural (AST) vs. Bit-Level Mutation
+
+Rather than treating input as a flat byte stream, `proto-fuzzer` applies a **hybrid** mutation model:
+
+```text
+                       tpm::TPMCommandSequence
+                                  │
+                 ┌────────────────┴────────────────┐
+                 ▼                                 ▼
+      Structural Mutation                Leaf Field Mutation
+    (Protobuf AST Operations)             (Type-Dependent)
+    ──────────────────────────           ───────────────────
+    • Add / Delete Command               • Enum: Schema selection
+    • Switch `oneof` variant             • Integer: libFuzzer bit flips
+    • Crossover splice from seed         • Bytes: In-buffer bit/byte flips
+```
+
+#### 1. Phase A: Protobuf AST Walk (`MutationSampler`)
+`libprotobuf-mutator` parses the serialized test case into an in-memory `google::protobuf::Message` tree and samples one of several mutation types:
+* **`Add`**: Appends a new `TPMCommand` to the sequence, adds an authorization session, or enables an optional field.
+* **`Delete`**: Clears an optional field or removes a command from the sequence.
+* **`Copy` / `Clone`**: Copies a compatible field or message from elsewhere in the sequence or from another seed file.
+* **`Mutate`**: Modifies the value of an existing leaf field.
+
+#### 2. Phase B: Leaf Field Value Mutation
+When `Mutate` is chosen, the behavior depends strictly on the field's schema type:
+* **Enums (`TPMALG`, `TPMCC`, `TPMRH`, `TPMSE`) $\rightarrow$ Schema Selection Only**:
+  The mutator does **not** flip bits on enums. It calculates `(index + 1 + rand) % count`, ensuring the enum value is always a syntactically valid constant defined in the `.proto` schema.
+* **Integers & Floats (`uint32`, `int32`, `float`) $\rightarrow$ Bit Manipulation**:
+  The mutator calls `LLVMFuzzerMutate(&value, sizeof(value), sizeof(value))`. libFuzzer applies bit flips, arithmetic offsets ($+1, -1$), boundary numbers (`0`, `0xFFFFFFFF`), and dictionary comparison constants. However, this manipulation is strictly isolated to those 4 or 8 bytes and cannot corrupt envelope lengths.
+* **Byte Arrays (`bytes buffer`, `string`) $\rightarrow$ In-Buffer Bit Manipulation**:
+  Fields representing arbitrary data (payloads, nonces, sensitive buffers) are mutated via `LLVMFuzzerMutate` directly on the buffer content (insertions, deletions, bit flips).
+
+#### 3. Phase C: Normalization and Wire Marshaling
+1. **Post-Processors (`proto_postprocessors.cc` & `proto_normalization.cc`)**: Run immediately after mutation to enforce required invariants (e.g., matching command tags `TPM_ST_SESSIONS` vs `TPM_ST_NO_SESSIONS`, setting parent handle defaults to `0x80000000`, and sizing policy digests according to the selected hash algorithm).
+2. **Wire Marshaling (`proto_conversion.cc`)**: Encodes the message into standard TPM 2.0 big-endian wire format via `tss2-mu` libraries and patches the 4-byte header command size.
+3. **Session HMAC Patching (`src/proto-fuzzer.cc`):** Invokes `SessionAuthPatchCommand` to dynamically compute valid HMAC authorization values before sending packets to the TPM.
+
+---
+
+### C. Subtree Crossover Mechanics & Tree Topology
+
+#### 1. What "Favors Mutating Existing Seeds" Means
+Rather than generating completely random Protobuf commands from scratch on every iteration, libFuzzer maintains an **evolutionary corpus queue**:
+1. It loads checked-in seeds from `seeds/proto/`.
+2. On each iteration, it picks an already-functioning seed from the corpus.
+3. It makes **small, targeted modifications** to that seed. If the modification reaches new code paths in the TPM, that new mutant is saved back into the corpus to serve as a parent for future mutations.
+
+Because mutations start from functioning seeds (like `CreatePrimary` $\to$ `Create` $\to$ `Load`), the high-level logic and valid handle ordering are mostly preserved.
+
+#### 2. What "Subtree Crossover" Means
+In genetic algorithms, **crossover** combines parts of two parent inputs (Parent A and Parent B) from the corpus to produce a child input. In `libprotobuf-mutator` (`Mutator::CrossOver` in `vendor/libprotobuf-mutator/src/mutator.cc`), crossover is **AST-aware**:
+* It views every Protobuf message as a **tree of nodes**.
+* It picks a branch in Parent B, searches Parent A for another field or sub-message of the **exact same Protobuf message type** (`DataSourceSampler::SampleImpl`), and **splices that entire branch (the "subtree") into Parent B**.
+
+#### 3. Tree Topology in this Codebase
+In Protobuf reflection, **every nested message and field is a node in a tree**:
+
+```text
+[Level 0: Root Node]               tpm::TPMCommandSequence
+                                              │
+                      ┌───────────────────────┴───────────────────────┐
+                      ▼                                               ▼
+[Level 1: Commands] TPMCommand [0]                              TPMCommand [1]
+                      │ (oneof)                                       │ (oneof)
+                      ▼                                               ▼
+[Level 2: Specific  tpm_commands::TPMCreatePrimary              tpm_commands::TPMLoad
+          Command]    │                                               │
+           ┌──────────┼──────────────┬─────────────┐                  ├─────────────┐
+           ▼          ▼              ▼             ▼                  ▼             ▼
+[Level 3:  header  hierarchy    in_sensitive   in_public         parent_handle  in_public
+ Parameters] (Message) (Enum)     (Message)     (Message)            (UInt32)    (Message)
+                                     │             │
+                                     │             ├─────────────────┐
+                                     ▼             ▼                 ▼
+[Level 4: Nested               sensitive      public_area          unique
+ Sub-messages]                 (Message)       (Message)         (Message)
+                                                   │
+                                                   ├─────────────────┐
+                                                   ▼                 ▼
+[Level 5: Inner                                parameters         auth_policy
+ Structures]                                   (Message)          (Message)
+                                                   │
+                                                   ▼
+[Level 6: Algorithm Details]                     rsa
+                                              (Message)
+                                                   │
+                                     ┌─────────────┼─────────────┐
+                                     ▼             ▼             ▼
+[Level 7: Leaf Fields]           symmetric      key_bits      scheme
+                                   (Enum)       (UInt32)      (Enum)
+```
+
+* **Command-Level Subtree (Level 1/2):** Splicing a whole command (e.g. copying an entire `TPM2_Load` command with all its parameters from Parent A into Parent B).
+* **Parameter-Level Subtree (Level 3/4):** Splicing a complex parameter block (e.g. copying an entire `in_public` RSA key parameter structure from Parent A into a `TPM2_Create` command in Parent B).
+* **Subsequent Descendant Nodes:** When an intermediate node (like `in_public`) is spliced, all of its descendant nodes (`public_area` $\to$ `parameters` $\to$ `rsa` $\to$ `key_bits`, etc.) travel together as a cohesive unit. This preserves internal consistency between nested fields.
+
+---
+
+### D. Command Families, Statefulness, and Non-Blind Mutation
+
+#### 1. The Architectural Problem
+TPM 2.0 commands belong to distinct functional categories:
+* **Setup / Lifecycle:** `TPM2_CreatePrimary`, `TPM2_Create`, `TPM2_StartAuthSession`
+* **Operational / Actionable:** `TPM2_Load`, `TPM2_RSA_Decrypt`, `TPM2_PCR_Extend`, `TPM2_GetRandom`
+* **Teardown / Terminal:** `TPM2_Clear`, `TPM2_FlushContext`, `TPM2_Shutdown`
+
+Because TPM 2.0 is a state machine with strict handle dependencies, running random commands in arbitrary order causes premature failures (e.g., `TPM_RC_HANDLE` `0x018b`).
+
+#### 2. Does the Project Implement Family Splitting?
+**At the mutator engine level: No.** `libprotobuf-mutator` views `TPMCommandSequence` as a uniform list of `TPMCommand` union items. It does not employ an explicit grammar automaton, slot-based sequence structure, or Markov transition probability matrix.
+
+#### 3. Why It Is Not "Blindly Mutating"
+The project prevents random sequence thrashing through four compensating mechanisms:
+1. **Multi-Command Workflow Seeds (`seeds/proto/`):** Seeds are structured chains (e.g., `TPM2_CreatePrimary` $\to$ `TPM2_Create` $\to$ `TPM2_Load`). Because mutation starts from these seeds and uses subtree crossover, working progressions are preserved.
+2. **Dynamic Session & Handle Interception (`session_auth.cc`):** Intercepts TPM response buffers, captures live runtime handles and nonces, and patches them into subsequent commands in the sequence.
+3. **Handle Normalization (`proto_normalization.cc`):** Post-processors automatically set parent handles on `Load` and `Create` commands to `0x80000000` (the standard transient handle allocated by `CreatePrimary`).
+4. **Coverage-Guided Evolutionary Pruning:** Sequences that place terminal or invalid commands early exit with errors at the top-level dispatcher, yielding no new coverage counters and getting discarded by libFuzzer.
+
+---
+
+### E. Cryptographically Aware Operations: Default Initializations
+
+When generating or normalizing cryptographic commands, `proto_normalization.cc` provisions specific default configurations:
+
+#### 1. Primary & Child Keys (`TPM2_CreatePrimary`, `TPM2_Create`)
+* **Algorithm Type (`type`):** Defaults to `TPM_ALG_RSA` (or `TPM_ALG_KEYEDHASH` if RSA parameters are missing).
+* **Name Algorithm (`name_alg`):** Defaults to `TPM_ALG_SHA256` (`0x000B`).
+* **Symmetric Cipher:** Defaults to `TPM_ALG_AES` (128-bit key, CFB mode in `proto_conversion.cc`).
+* **Key Scheme:** Defaults to `TPM_ALG_NULL` (`0x0010`).
+* **Key Length:** Defaults to 2048 bits (`0x0800`).
+* **Public Exponent:** Defaults to 0 (the TPM specification interprets 0 as the standard default $e = 2^{16} + 1 = 65537$).
+* **Object Attributes (`object_attributes`):**
+  * Storage Parent Keys (`kStorageParentObjectAttributes` = `0x00030462`):
+    `fixedTPM | fixedParent | sensitiveDataOrigin | userWithAuth | noDA | restricted | decrypt`
+  * Child Keys (`kChildObjectAttributes` = `0x00030462`).
+* **Hierarchy:** Defaults to Owner hierarchy (`TPM_RH_OWNER` = `0x40000001`).
+
+#### 2. Authorization Sessions (`TPM2_StartAuthSession`)
+* **Session Type (`session_type`):** `TPM_SE_HMAC` (`0x00`).
+* **TPM Key (`tpm_key`):** `TPM_RH_NULL` (`0x40000007`) (unbound, unencrypted salt).
+* **Bind Handle (`bind`):** `TPM_RH_NULL` (`0x40000007`).
+* **Auth Hash (`auth_hash`):** `TPM_ALG_SHA256` (`0x000B`).
+* **Symmetric Cipher:** `TPM_ALG_NULL` (`0x0010`) (no parameter encryption).
+* **Caller Nonce:** Initialized to 16 zero bytes (and dynamically injected with `0xAA` fill by `session_auth.cc`).
+
+#### 3. Authorization Policies (`TPM2_SetPrimaryPolicy`)
+* The policy digest buffer size is clamped to match the selected hash algorithm:
+  * `TPM_ALG_SHA1`: 20 bytes.
+  * `TPM_ALG_SHA256`: 32 bytes.
+  * `TPM_ALG_SHA384`: 48 bytes.
+  * `TPM_ALG_NULL`: 0 bytes.
+
+---
+
+### F. Why Cryptographic Operations Are Rejected by the TPM
+
+When cryptographic commands fail during fuzzing, they are rejected by the TPM core with specific return codes:
+
+| Response Code | Hex | Root Cause in Fuzzing Context |
+| :--- | :--- | :--- |
+| **`TPM_RC_ATTRIBUTES`** | `0x00000182` | **Conflicting Object Attributes.** E.g., `TPM2_RSA_Decrypt` is called using a storage parent key that has `restricted = 1`. In TPM 2.0, a restricted key can only decrypt internal TPM data (like session salts or credentials), never arbitrary user ciphertext. |
+| **`TPM_RC_HANDLE`** | `0x0000018B` | **Missing or Invalid Handle.** The command targets a key handle (`0x80000000`) that was never generated, was flushed by a previous command, or was purged by `TPM2_Clear`. |
+| **`TPM_RC_AUTH_FAIL`** | `0x0000019E` | **HMAC Verification Failure.** The caller HMAC injected into the session does not match the TPM's calculation over `cpHash = Hash(CC \|\| Names \|\| Parameters)`. |
+| **`TPM_RC_BAD_AUTH`** | `0x00000122` | **Authorization Value Mismatch.** The entity authValue (password or key authorization secret) did not match the expected secret. |
+| **`TPM_RC_SCHEME`** | `0x0000012D` | **Incompatible Padding Scheme.** Attempting an RSA operation with a scheme (e.g. OAEP) that conflicts with the key template's specified scheme, or providing an unsupported hash algorithm selector. |
+| **`TPM_RC_SIZE`** | `0x00000195` | **Mismatched Buffer Length.** `TPM2_RSA_Decrypt` expects the ciphertext buffer size to exactly equal the key modulus length (e.g. 256 bytes for RSA 2048). Mutating buffer lengths triggers immediate rejection. |
+| **`TPM_RC_VALUE`** | `0x00000184` | **Out-of-Range Mathematical Value.** In RSA decryption, the integer value of the ciphertext buffer must be strictly less than the public modulus $n$ ($c < n$). Randomly mutated byte buffers often exceed $n$. |
+| **`TPM_RC_BINDING`** | `0x000001C0` | **Parent-Child Cryptographic Mismatch.** In `TPM2_Load`, the child key's encrypted sensitive area cannot be decrypted by the parent key or fails the integrity HMAC check. |
+| **`TPM_RC_HIERARCHY`** | `0x00000185` | **Disabled Hierarchy.** The command references a hierarchy (Owner, Platform, Endorsement) that has been disabled or locked out. |
+
+---
+
+### G. Architectural Tradeoffs: Splitting Families vs. Unified Fuzzing
+
+| Approach | Advantages | Disadvantages |
+| :--- | :--- | :--- |
+| **Strict Family Splitting** (e.g., isolated NV fuzzer, isolated Crypto fuzzer) | Higher throughput; zero wasted iterations on incompatible handles; deeper intra-family branch depth. | Requires importing setup/session commands anyway; misses negative paths and critical **cross-family state confusion bugs** (e.g., handle type confusion, session reuse after `Clear`, or resource exhaustion across subsystems). |
+| **Unified Fuzzing + Dynamic Patching** *(Current Implementation)* | Discovers unexpected cross-family interactions; handles real-world session authorization; single unified pipeline. | Can spend cycles generating sequences with broken handle prerequisites unless seeded effectively. |
+| **Hybrid Workflow Templates** *(Recommended Evolution)* | Preserves prerequisite setup phases (`setup_phase` $\to$ `action_phase` $\to$ `chaos_phase`) while focusing mutation within targeted families. | Requires maintaining stricter protobuf schemas and generation templates. |
+
+---
+
+## 6. Build, Test, and Execution Workflows
 
 ### Running via Docker Compose
 ```bash
@@ -452,7 +672,7 @@ A common question is: *Where in the project source code does it check if a new l
 
 ---
 
-## 6. Grill Me: Technical Knowledge Assessment
+## 7. Grill Me: Technical Knowledge Assessment
 
 > **Test your understanding before continuing development!** The questions below cover critical aspects of this codebase, TPM 2.0 specifications, and libFuzzer mechanics.
 
@@ -528,4 +748,44 @@ _plat__NVDisable((void*)1, 0);
 ```
 `TPMShutdown()` commits and disables the NV chip, but if the underlying storage file (`NVChip`) is not deleted or if `_plat__TearDown()` is commented out, persistent objects or NV spaces defined by earlier iterations persist into later iterations!
 Eventually, the TPM's NVRAM capacity fills up completely, causing subsequent allocation commands to fail.
+</details>
+
+---
+
+### Question 5: Subtree Crossover & Type Safety
+**Scenario:** `Mutator::CrossOver` runs between Parent A (`TPM2_CreatePrimary` sequence) and Parent B (`TPM2_Create` sequence). Can the crossover algorithm accidentally take the `in_sensitive` parameter from Parent A and splice it into the `in_public` parameter of Parent B?
+* **Why or why not? What exact checks does `DataSourceSampler::SampleImpl` perform before selecting a node to copy?**
+
+<details>
+<summary>👉 Reveal Answer</summary>
+
+**Answer:**
+**No, it cannot.**
+In `vendor/libprotobuf-mutator/src/mutator.cc`, `DataSourceSampler::SampleImpl` checks:
+```cpp
+if (field->cpp_type() != match_.cpp_type()) continue;
+if (match_.cpp_type() == FieldDescriptor::CPPTYPE_MESSAGE) {
+  if (field->message_type() != match_.message_type()) continue;
+}
+```
+Because `in_sensitive` has descriptor type `tpm_types.TPM2BSensitiveCreate` and `in_public` has descriptor type `tpm_types.TPM2BPublic`, the message descriptors do not match. The mutator strictly enforces type identity down the Protobuf schema hierarchy, so a subtree can only be spliced into a target node of the exact same message type.
+</details>
+
+---
+
+### Question 6: Cryptographic Rejection: The `restricted` Decrypt Trap
+**Scenario:** A fuzzing run executes `TPM2_CreatePrimary` with default attributes, successfully obtaining transient handle `0x80000000`. The next command in the sequence is `TPM2_RSA_Decrypt` targeting handle `0x80000000` with valid session authorization. The TPM immediately returns response code `0x00000182` (`TPM_RC_ATTRIBUTES`).
+* **Why did the TPM reject this cryptographically valid operation?**
+* **Which exact bit in `TPMA_OBJECT` causes this failure according to the TPM 2.0 specification?**
+
+<details>
+<summary>👉 Reveal Answer</summary>
+
+**Answer:**
+The key was created with the `restricted` attribute bit set (`kAttrRestricted = 0x00010000`)!
+In `proto_normalization.cc`, `kStorageParentObjectAttributes` sets both `kAttrDecrypt` and `kAttrRestricted` so that the primary key can function as a Storage Root Key.
+Under the TPM 2.0 specification (Part 1, Architecture, §25):
+* A key with `restricted = 1` and `decrypt = 1` is a **Storage Key**. It can only be used by the TPM to decrypt internal data structures (such as child private areas during `TPM2_Load` or credential activations during `TPM2_ActivateCredential`).
+* A storage key is **strictly forbidden from decrypting caller-provided external ciphertexts** via `TPM2_RSA_Decrypt`. Attempting general decryption triggers `TPM_RC_ATTRIBUTES`.
+* For `TPM2_RSA_Decrypt` to succeed, the key must have `decrypt = 1` and `restricted = 0` (a general-purpose decryption key).
 </details>
