@@ -7,6 +7,12 @@ on:
   pull_request:
     branches:
       - main
+  workflow_dispatch:
+
+# Cancel superseded runs for the same event + ref (e.g. new push to a PR).
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 
 # CI Jobs only need read-only access to the Repo conents
 permissions:
@@ -70,22 +76,21 @@ jobs:
 
       - name: Verify
         run: ./build/Fuzzer -help=1
-  docker-build-fuzzer:
-    name: Test Docker Build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+
+      # Short sanity run: seeds/bytearray for 60s; fails CI on any crash/sanitizer report.
+      - name: Fuzzer smoke run (60s)
+        run: |
+          mkdir -p smoke-corpus smoke-artifacts
+          ./build/Fuzzer -max_total_time=60 -artifact_prefix=smoke-artifacts/ \
+            smoke-corpus seeds/bytearray
+
+      - name: Upload smoke-run crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
         with:
-          submodules: recursive
-      - name: Build
-        uses: docker/build-push-action@v6
-        with:
-          push: false
-          pull: false
-          file: Dockerfile
-          target: fuzzer
-          tags: SUSE-26-03-Google/fuzzer:latest
+          name: fuzzer-smoke-crashes
+          path: smoke-artifacts/
+          if-no-files-found: ignore
 
   format:
     name: Check code format
@@ -124,9 +129,20 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Build test image
-        run: |
-          docker build --target test -t tpm-unit-tests .
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          target: test
+          push: false
+          load: true
+          tags: tpm-unit-tests
+          cache-from: type=gha,scope=test
+          cache-to: type=gha,mode=max,scope=test
 
       - name: Run unit tests
         run: |
