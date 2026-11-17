@@ -1,5 +1,5 @@
 # TPM 2.0 Fuzzer
-[![CI](https://github.com/SeattleU-MSCS-26-03-2026/TPM-Fuzzer/actions/workflows/ci.yml/badge.svg)](https://github.com/SeattleU-MSCS-26-03-2026/TPM-Fuzzer/actions/workflows/ci.yml)
+[![CI](https://github.com/Siputroj/TPM-Fuzzer-AI/actions/workflows/ci.yml/badge.svg)](https://github.com/Siputroj/TPM-Fuzzer-AI/actions/workflows/ci.yml)
 
 ## Overview
 
