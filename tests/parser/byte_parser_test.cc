@@ -101,3 +101,5 @@ TEST_CASE("parseCommands accepts header-only command") {
 }
 
 
+
+TEST_CASE("ci canary - must fail") { REQUIRE(1 == 2); }
