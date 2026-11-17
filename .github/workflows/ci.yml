@@ -12,7 +12,7 @@ on:
 # Cancel superseded runs for the same event + ref (e.g. new push to a PR).
 concurrency:
   group: ci-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # CI Jobs only need read-only access to the Repo conents
 permissions:
@@ -79,6 +79,9 @@ jobs:
 
       # Short sanity run: seeds/bytearray for 60s; fails CI on any crash/sanitizer report.
       - name: Fuzzer smoke run (60s)
+        env:
+          # Make UBSan (signed-integer-overflow) reports fatal instead of log-only.
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: |
           mkdir -p smoke-corpus smoke-artifacts
           ./build/Fuzzer -max_total_time=60 -artifact_prefix=smoke-artifacts/ \
@@ -146,4 +149,4 @@ jobs:
 
       - name: Run unit tests
         run: |
-          docker run --rm tpm-unit-tests
+          docker run --rm tpm-unit-tests ctest --test-dir /srv/build --verbose --no-tests=error
