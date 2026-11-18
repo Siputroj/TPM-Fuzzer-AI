@@ -21,6 +21,7 @@ Resources:
 """
 
 import subprocess
+import hashlib
 
 from typing import Callable, Dict, List, Optional, Sequence, Union
 import os
@@ -594,6 +595,23 @@ def tpm_pcr_setauthpolicy_seeds() -> SeedVariants:
         ]
     )
 
+    # Variant 7: PCR 20 (0x00000014) belongs to policyAuthGroup — hits the
+    # TPM_RC_SUCCESS NV-write branch of PCR_SetAuthPolicy.c under an HMAC session.
+    variants.append(
+        [
+            TPMStartAuthSession(
+                TPM_RH.NULL, TPM_RH.NULL, session_type=TPM_SE.TPM_SE_HMAC
+            ),
+            TPMPCRSetAuthPolicy(
+                auth_handle=TPM_RH.PLATFORM.value,
+                auth_policy=bytes.fromhex("77" * 32),
+                hash_alg=TPM_ALG.SHA256,
+                pcr_num=0x00000014,
+                session_handle=TPM_FIRST_HMAC_SESSION_HANDLE,
+            ),
+        ]
+    )
+
     return variants
 
 
@@ -1153,6 +1171,467 @@ def tpm_rsa_decrypt_seeds() -> SeedVariants:
     return [variant0, variant1, variant2]
 
 
+def _hmac_keyedhash_primary(
+    session_handle: Union[int, TPM_RS] = TPM_RS.PW,
+    restricted: bool = False,
+    sign: bool = True,
+    hash_alg: TPM_ALG = TPM_ALG.SHA256,
+) -> TPMCreatePrimary:
+    attrs = [
+        TPMA_OBJECT.FIXEDTPM,
+        TPMA_OBJECT.FIXEDPARENT,
+        TPMA_OBJECT.SENSITIVEDATAORIGIN,
+        TPMA_OBJECT.USERWITHAUTH,
+        TPMA_OBJECT.NODA,
+    ]
+    if sign:
+        attrs.append(TPMA_OBJECT.SIGN_ENCRYPT)
+    if restricted:
+        attrs.append(TPMA_OBJECT.RESTRICTED)
+    return TPMCreatePrimary(
+        session_handle=session_handle,
+        hashAlg=hash_alg,
+        keyBits=2048,
+        public_template=TPM2B_PUBLIC(
+            public_area=TPMT_PUBLIC(
+                type=TPM_ALG.KEYEDHASH,
+                name_alg=hash_alg,
+                object_attributes=attrs,
+                keyedhash_scheme=TPMS_KEYEDHASH_PARMS(
+                    scheme=TPM_ALG.HMAC, hash_alg=hash_alg
+                ),
+            )
+        ),
+    )
+
+
+def tpm_start_auth_session_hmac_seeds() -> SeedVariants:
+    """
+    Generates structured HMAC-session seeds for proto-fuzzer (and bytearray).
+    Exercises single-command and multi-command HMAC-authorized sequences across
+    CreatePrimary, Create, Load, RSADecrypt, SetPrimaryPolicy, Clear, PCREvent,
+    and PCRAllocate.
+    """
+    start_hmac = TPMStartAuthSession(
+        TPM_RH.NULL, TPM_RH.NULL, session_type=TPM_SE.TPM_SE_HMAC
+    )
+
+    non_restricted_decrypt_primary_hmac = TPMCreatePrimary(
+        session_handle=TPM_FIRST_HMAC_SESSION_HANDLE,
+        hashAlg=TPM_ALG.SHA256,
+        keyBits=2048,
+        public_template=TPM2B_PUBLIC(
+            public_area=TPMT_PUBLIC(
+                type=TPM_ALG.RSA,
+                name_alg=TPM_ALG.SHA256,
+                object_attributes=[
+                    TPMA_OBJECT.FIXEDTPM,
+                    TPMA_OBJECT.FIXEDPARENT,
+                    TPMA_OBJECT.SENSITIVEDATAORIGIN,
+                    TPMA_OBJECT.USERWITHAUTH,
+                    TPMA_OBJECT.NODA,
+                    TPMA_OBJECT.DECRYPT,
+                ],
+                rsa_parameters=TPMS_RSA_PARMS(
+                    symmetric=TPMS_SYM_DEF_OBJECT(algorithm=TPM_ALG.NULL),
+                    scheme=TPM_ALG.NULL,
+                    key_bits=2048,
+                ),
+            )
+        ),
+    )
+
+    return [
+        # Variant 0: standalone StartAuthSession(HMAC)
+        [start_hmac],
+        # Variant 1: StartAuthSession(HMAC) -> CreatePrimary(HMAC)
+        [
+            start_hmac,
+            TPMCreatePrimary(TPM_FIRST_HMAC_SESSION_HANDLE, TPM_ALG.SHA256, 2048),
+        ],
+        # Variant 2: Multi-command HMAC object lifecycle (CreatePrimary -> Create -> Load)
+        [
+            start_hmac,
+            TPMCreatePrimary(TPM_FIRST_HMAC_SESSION_HANDLE, TPM_ALG.SHA256, 2048),
+            TPMCreate(
+                0x80000000,
+                TPM_FIRST_HMAC_SESSION_HANDLE,
+                TPM_ALG.SHA256,
+                key_type=TPM_ALG.KEYEDHASH,
+                keyBits=2048,
+                object_attributes=[
+                    TPMA_OBJECT.FIXEDTPM,
+                    TPMA_OBJECT.FIXEDPARENT,
+                    TPMA_OBJECT.USERWITHAUTH,
+                    TPMA_OBJECT.NODA,
+                ],
+                keyedhash_scheme=TPMS_KEYEDHASH_PARMS(scheme=TPM_ALG.NULL),
+                sensitive_data=b"hello secret",
+            ),
+            TPMLoad(
+                0x80000000,
+                _UNSEAL_SEAL_IN_PRIVATE,
+                _UNSEAL_SEAL_IN_PUBLIC,
+                session_handle=TPM_FIRST_HMAC_SESSION_HANDLE,
+            ),
+        ],
+        # Variant 3: Multi-command HMAC hierarchy administration (SetPrimaryPolicy -> Clear)
+        [
+            start_hmac,
+            TPMSetPrimaryPolicy(
+                auth_handle=TPM_RH.OWNER,
+                auth_policy=b"\x00" * 32,
+                hash_alg=TPM_ALG.SHA256,
+                session_handle=TPM_FIRST_HMAC_SESSION_HANDLE,
+            ),
+            TPMClear(
+                auth_handle=TPM_RH.LOCKOUT,
+                session_handle=TPM_FIRST_HMAC_SESSION_HANDLE,
+            ),
+        ],
+        # Variant 4: Multi-command HMAC PCR operations (PCREvent -> PCRAllocate)
+        [
+            start_hmac,
+            TPMPCREvent(
+                0x00000000,
+                b"hmac event payload",
+                session_handle=TPM_FIRST_HMAC_SESSION_HANDLE,
+            ),
+            TPMPCRAllocate(
+                TPML_PCR_SELECTION(
+                    selections=[
+                        TPMS_PCR_SELECTION(
+                            hash=TPM_ALG.SHA256, pcr_select=bytes.fromhex("010002")
+                        )
+                    ]
+                ),
+                session_handle=TPM_FIRST_HMAC_SESSION_HANDLE,
+            ),
+        ],
+        # Variant 5: Multi-command HMAC RSA Decrypt (CreatePrimary -> RSADecrypt)
+        [
+            start_hmac,
+            non_restricted_decrypt_primary_hmac,
+            TPMRSADecrypt(
+                key_handle=0x80000000,
+                cipher_text=b"\x00" * 256,
+                in_scheme=TPMT_RSA_DECRYPT(scheme=TPM_ALG.RSAES),
+                session_handle=TPM_FIRST_HMAC_SESSION_HANDLE,
+            ),
+        ],
+        # Variant 6: SHA-384 HMAC session + Clear
+        [
+            TPMStartAuthSession(
+                TPM_RH.NULL,
+                TPM_RH.NULL,
+                session_type=TPM_SE.TPM_SE_HMAC,
+                auth_hash=TPM_ALG.SHA384,
+            ),
+            TPMClear(
+                auth_handle=TPM_RH.LOCKOUT,
+                session_handle=TPM_FIRST_HMAC_SESSION_HANDLE,
+            ),
+        ],
+    ]
+
+
+def tpm_mac_seeds() -> SeedVariants:
+    """
+    Generates Byte-Fuzzer seeds for TPM2_MAC (TPM2_HMAC, MAC.c).
+    Covers success path, HMAC-session authorized path, TPM_RCS_TYPE,
+    TPM_RCS_ATTRIBUTES, and TPM_RCS_VALUE branches.
+    """
+    start_hmac = TPMStartAuthSession(
+        TPM_RH.NULL, TPM_RH.NULL, session_type=TPM_SE.TPM_SE_HMAC
+    )
+    return [
+        # Variant 0: success path with PW session
+        [
+            _hmac_keyedhash_primary(TPM_RS.PW),
+            TPMMAC(0x80000000, b"message to mac", TPM_ALG.SHA256),
+        ],
+        # Variant 1: success path authorized via HMAC session 0x02000000
+        [
+            start_hmac,
+            _hmac_keyedhash_primary(TPM_FIRST_HMAC_SESSION_HANDLE),
+            TPMMAC(
+                0x80000000,
+                b"hmac session mac payload",
+                TPM_ALG.SHA256,
+                session_handle=TPM_FIRST_HMAC_SESSION_HANDLE,
+            ),
+        ],
+        # Variant 2: key is RSA (not KEYEDHASH) -> TPM_RCS_TYPE
+        [
+            TPMCreatePrimary(TPM_RS.PW, TPM_ALG.SHA256, 2048),
+            TPMMAC(0x80000000, b"type error", TPM_ALG.SHA256),
+        ],
+        # Variant 3: key is restricted -> TPM_RCS_ATTRIBUTES
+        [
+            _hmac_keyedhash_primary(TPM_RS.PW, restricted=True),
+            TPMMAC(0x80000000, b"restricted error", TPM_ALG.SHA256),
+        ],
+        # Variant 4: scheme hash mismatch (SHA384 vs SHA256 key) -> TPM_RCS_VALUE
+        [
+            _hmac_keyedhash_primary(TPM_RS.PW, hash_alg=TPM_ALG.SHA256),
+            TPMMAC(0x80000000, b"scheme mismatch", TPM_ALG.SHA384),
+        ],
+    ]
+
+
+def tpm_mac_sequence_seeds() -> SeedVariants:
+    """
+    Generates Byte-Fuzzer seeds for TPM2_MAC_Start -> SequenceUpdate -> SequenceComplete.
+    Exercises both PW and HMAC session (0-byte sequence Name) paths.
+    """
+    start_hmac = TPMStartAuthSession(
+        TPM_RH.NULL, TPM_RH.NULL, session_type=TPM_SE.TPM_SE_HMAC
+    )
+    return [
+        # Variant 0: full HMAC sequence with PW session
+        [
+            _hmac_keyedhash_primary(TPM_RS.PW),
+            TPMMACStart(0x80000000, TPM_ALG.SHA256),
+            TPMSequenceUpdate(0x80000001, b"part 1 of message "),
+            TPMSequenceComplete(0x80000001, b"part 2 of message"),
+        ],
+        # Variant 1: full HMAC sequence authorized via HMAC session 0x02000000
+        [
+            start_hmac,
+            _hmac_keyedhash_primary(TPM_FIRST_HMAC_SESSION_HANDLE),
+            TPMMACStart(
+                0x80000000,
+                TPM_ALG.SHA256,
+                session_handle=TPM_FIRST_HMAC_SESSION_HANDLE,
+            ),
+            TPMSequenceUpdate(
+                0x80000001,
+                b"authenticated chunk 1 ",
+                session_handle=TPM_FIRST_HMAC_SESSION_HANDLE,
+            ),
+            TPMSequenceComplete(
+                0x80000001,
+                b"authenticated chunk 2",
+                session_handle=TPM_FIRST_HMAC_SESSION_HANDLE,
+            ),
+        ],
+        # Variant 2: MAC_Start error paths (RSA key -> TPM_RCS_TYPE; restricted -> TPM_RCS_ATTRIBUTES)
+        [
+            TPMCreatePrimary(TPM_RS.PW, TPM_ALG.SHA256, 2048),
+            TPMMACStart(0x80000000, TPM_ALG.SHA256),
+            _hmac_keyedhash_primary(TPM_RS.PW, restricted=True),
+            TPMMACStart(0x80000001, TPM_ALG.SHA256),
+        ],
+    ]
+
+
+def tpm_hash_sequence_seeds() -> SeedVariants:
+    """
+    Generates Byte-Fuzzer seeds for HashSequenceStart, SequenceUpdate,
+    SequenceComplete, and EventSequenceComplete.
+    """
+    start_hmac = TPMStartAuthSession(
+        TPM_RH.NULL, TPM_RH.NULL, session_type=TPM_SE.TPM_SE_HMAC
+    )
+    return [
+        # Variant 0: Hash sequence with OWNER validation ticket
+        [
+            TPMHashSequenceStart(TPM_ALG.SHA256),
+            TPMSequenceUpdate(0x80000000, b"hash sequence block 1"),
+            TPMSequenceComplete(
+                0x80000000, b"hash sequence block 2", hierarchy=TPM_RH.OWNER
+            ),
+        ],
+        # Variant 1: Event sequence completed via EventSequenceComplete on PCR 0
+        [
+            TPMHashSequenceStart(TPM_ALG.NULL),
+            TPMSequenceUpdate(0x80000000, b"event sequence block 1"),
+            TPMEventSequenceComplete(0x00000000, 0x80000000, b"event block 2"),
+        ],
+        # Variant 2: Hash sequence authorized via HMAC session 0x02000000
+        [
+            start_hmac,
+            TPMHashSequenceStart(TPM_ALG.SHA256),
+            TPMSequenceUpdate(
+                0x80000000,
+                b"hmac hash block",
+                session_handle=TPM_FIRST_HMAC_SESSION_HANDLE,
+            ),
+            TPMSequenceComplete(
+                0x80000000,
+                b"hmac final block",
+                hierarchy=TPM_RH.NULL,
+                session_handle=TPM_FIRST_HMAC_SESSION_HANDLE,
+            ),
+        ],
+    ]
+
+
+def tpm_policy_session_seeds() -> SeedVariants:
+    """
+    Generates Byte-Fuzzer seeds for Enhanced Authorization (Policy & Trial sessions).
+    """
+    policy_handle = 0x03000000
+    cc_clear_policy = hashlib.sha256(
+        b"\x00" * 32
+        + (0x0000016C).to_bytes(4, "big")
+        + (0x00000126).to_bytes(4, "big")
+    ).digest()
+    # Per TPM 2.0 Part 3 §23.8 (PolicyPassword.c:17), TPM2_PolicyPassword hashes
+    # TPM_CC_PolicyAuthValue (0x0000016B) into policyDigest.
+    pw_policy = hashlib.sha256(
+        b"\x00" * 32 + (0x0000016B).to_bytes(4, "big")
+    ).digest()
+
+    return [
+        # Variant 0: End-to-end PolicyCommandCode session authorizing TPM2_Clear (Policy HMAC)
+        [
+            TPMSetPrimaryPolicy(
+                auth_handle=TPM_RH.LOCKOUT,
+                auth_policy=cc_clear_policy,
+                hash_alg=TPM_ALG.SHA256,
+            ),
+            TPMStartAuthSession(
+                TPM_RH.NULL, TPM_RH.NULL, session_type=TPM_SE.TPM_SE_POLICY
+            ),
+            TPMPolicyCommandCode(policy_handle, 0x00000126),
+            TPMPolicyGetDigest(policy_handle),
+            TPMClear(auth_handle=TPM_RH.LOCKOUT, session_handle=policy_handle),
+        ],
+        # Variant 1: End-to-end PolicyPassword session authorizing TPM2_Clear (CheckPWAuthSession)
+        [
+            TPMSetPrimaryPolicy(
+                auth_handle=TPM_RH.LOCKOUT,
+                auth_policy=pw_policy,
+                hash_alg=TPM_ALG.SHA256,
+            ),
+            TPMStartAuthSession(
+                TPM_RH.NULL, TPM_RH.NULL, session_type=TPM_SE.TPM_SE_POLICY
+            ),
+            TPMPolicyPassword(policy_handle),
+            TPMClear(auth_handle=TPM_RH.LOCKOUT, session_handle=policy_handle),
+        ],
+        # Variant 2: Policy assertion chain (PolicyAuthValue, PolicyLocality, PolicyPCR, PolicyRestart, PolicyCpHash, PolicyGetDigest)
+        [
+            TPMStartAuthSession(
+                TPM_RH.NULL, TPM_RH.NULL, session_type=TPM_SE.TPM_SE_POLICY
+            ),
+            TPMPolicyAuthValue(policy_handle),
+            TPMPolicyLocality(policy_handle, locality=0x01),
+            TPMPolicyPCR(
+                policy_handle,
+                TPML_PCR_SELECTION(
+                    selections=[
+                        TPMS_PCR_SELECTION(
+                            hash=TPM_ALG.SHA256, pcr_select=bytes.fromhex("010000")
+                        )
+                    ]
+                ),
+            ),
+            TPMPolicyRestart(policy_handle),
+            TPMPolicyCpHash(policy_handle, b"\x11" * 32),
+            TPMPolicyGetDigest(policy_handle),
+        ],
+        # Variant 3: Trial policy session with PolicyOR, PolicyNameHash, PolicyNvWritten, PolicySecret
+        [
+            TPMStartAuthSession(
+                TPM_RH.NULL, TPM_RH.NULL, session_type=TPM_SE.TPM_SE_TRIAL
+            ),
+            TPMPolicyCommandCode(policy_handle, 0x00000126),
+            TPMPolicyOR(policy_handle, [cc_clear_policy, b"\x22" * 32]),
+            TPMPolicyNameHash(policy_handle, b"\x33" * 32),
+            TPMPolicyNvWritten(policy_handle, written_set=1),
+            TPMPolicySecret(TPM_RH.OWNER, policy_handle),
+            TPMPolicyGetDigest(policy_handle),
+        ],
+    ]
+
+
+def tpm_parser_sanitizer_seeds() -> SeedVariants:
+    """
+    Generates Byte-Fuzzer seeds targeting unreached object/context/attestation/DA
+    handlers and low-level Marshal.c / Handle.c / SessionProcess.c paths.
+    """
+    nv_index = TPM_HT.NV_INDEX.value << 24
+    signing_primary = TPMCreatePrimary(
+        session_handle=TPM_RS.PW,
+        hashAlg=TPM_ALG.SHA256,
+        keyBits=2048,
+        public_template=TPM2B_PUBLIC(
+            public_area=TPMT_PUBLIC(
+                type=TPM_ALG.RSA,
+                name_alg=TPM_ALG.SHA256,
+                object_attributes=[
+                    TPMA_OBJECT.FIXEDTPM,
+                    TPMA_OBJECT.FIXEDPARENT,
+                    TPMA_OBJECT.SENSITIVEDATAORIGIN,
+                    TPMA_OBJECT.USERWITHAUTH,
+                    TPMA_OBJECT.NODA,
+                    TPMA_OBJECT.SIGN_ENCRYPT,
+                ],
+                rsa_parameters=TPMS_RSA_PARMS(
+                    symmetric=TPMS_SYM_DEF_OBJECT(algorithm=TPM_ALG.NULL),
+                    scheme=TPM_ALG.NULL,
+                    key_bits=2048,
+                ),
+            )
+        ),
+    )
+
+    return [
+        # Variant 0: Object & Context lifecycle (CreatePrimary -> ReadPublic -> ContextSave -> FlushContext)
+        [
+            TPMCreatePrimary(TPM_RS.PW, TPM_ALG.SHA256, 2048),
+            TPMReadPublic(0x80000000),
+            TPMContextSave(0x80000000),
+            TPMFlushContext(0x80000000),
+        ],
+        # Variant 1: Attestation Quote + DA Lock Reset + PCR_SetAuthValue + EncryptDecrypt2
+        [
+            signing_primary,
+            TPMQuote(
+                0x80000000,
+                b"qualifying nonce",
+                TPMT_SIG_SCHEME(scheme=TPM_ALG.RSASSA, hash_alg=TPM_ALG.SHA256),
+                TPML_PCR_SELECTION(
+                    selections=[
+                        TPMS_PCR_SELECTION(
+                            hash=TPM_ALG.SHA256, pcr_select=bytes.fromhex("010000")
+                        )
+                    ]
+                ),
+            ),
+            TPMDictionaryAttackLockReset(TPM_RH.LOCKOUT),
+            TPMPCRSetAuthValue(0x00000014, b"pcr20secret"),
+            TPMEncryptDecrypt2(0x80000000, b"block12345678901"),
+        ],
+        # Variant 2: HMAC-authorized NV_DefineSpace -> NV_Write -> NV_Read (exercises NV Name table)
+        [
+            TPMStartAuthSession(
+                TPM_RH.NULL, TPM_RH.NULL, session_type=TPM_SE.TPM_SE_HMAC
+            ),
+            TPMNVDefineSpace(
+                nv_index=nv_index,
+                attributes=[TPMA_NV.AUTHWRITE, TPMA_NV.AUTHREAD, TPMA_NV.NO_DA],
+                session_handle=TPM_FIRST_HMAC_SESSION_HANDLE,
+            ),
+            TPMNVWrite(
+                nv_index,
+                b"\xaa" * 32,
+                auth_handle=nv_index,
+                session_handle=TPM_FIRST_HMAC_SESSION_HANDLE,
+            ),
+            TPMNVRead(
+                nv_index,
+                16,
+                0,
+                auth_handle=nv_index,
+                session_handle=TPM_FIRST_HMAC_SESSION_HANDLE,
+            ),
+        ],
+    ]
+
+
 if __name__ == "__main__":
     # NOTE: Update this to include a seed function
     TEST_CASES = {
@@ -1199,19 +1678,12 @@ if __name__ == "__main__":
                 TPMCreatePrimary(TPM_RS.PW, TPM_ALG.SHA256, 2048),
             ],
         ],
-        "TPMStartAuthSessionHMAC": [
-            [
-                TPMStartAuthSession(
-                    TPM_RH.NULL, TPM_RH.NULL, session_type=TPM_SE.TPM_SE_HMAC
-                )
-            ],
-            [
-                TPMStartAuthSession(
-                    TPM_RH.NULL, TPM_RH.NULL, session_type=TPM_SE.TPM_SE_HMAC
-                ),
-                TPMCreatePrimary(TPM_FIRST_HMAC_SESSION_HANDLE, TPM_ALG.SHA256, 2048),
-            ],
-        ],
+        "TPMStartAuthSessionHMAC": tpm_start_auth_session_hmac_seeds,
+        "TPMMAC": tpm_mac_seeds,
+        "TPMMACSequence": tpm_mac_sequence_seeds,
+        "TPMHashSequence": tpm_hash_sequence_seeds,
+        "TPMPolicySession": tpm_policy_session_seeds,
+        "TPMParserSanitizer": tpm_parser_sanitizer_seeds,
         "TPMRSADecrypt": tpm_rsa_decrypt_seeds,
         "TPMRSAEncrypt": tpm_rsa_encrypt_seeds,
         "TPMMakeCredential": tpm_make_credential_seeds,

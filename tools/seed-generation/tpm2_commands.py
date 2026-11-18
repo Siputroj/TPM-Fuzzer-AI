@@ -1,3 +1,4 @@
+from __future__ import annotations
 import os
 
 from typing import List, Optional, Union
@@ -283,7 +284,7 @@ class TPMClear(TPMCommand):
         session = tpm_session_pb2.TPMSession(  # type: ignore
             session_handle=self._session_handle_val,
             nonce_size=0,
-            session_attributes=0,
+            session_attributes=1,
             hmac_size=0,
         )
 
@@ -346,7 +347,7 @@ class TPMSetPrimaryPolicy(TPMCommand):
             session_handle=self._session_handle_val,
             nonce_size=0,
             nonce=b"",
-            session_attributes=0,
+            session_attributes=1,
             hmac_size=0,
             hmac=b"",
         )
@@ -463,7 +464,9 @@ class TPMCreate(TPMCommand):
 
         auth_size = int.from_bytes(params[offset : offset + 4], BYTE_ORDER)
         auth_end = offset + 4 + auth_size
+        auth_bytes = params[offset:auth_end]
         offset = auth_end
+        sessions = self._proto_sessions(auth_bytes)
 
         in_sensitive, offset = self._parse_tpm2b(params, offset)
         in_public, offset = self._parse_tpm2b(params, offset)
@@ -474,6 +477,7 @@ class TPMCreate(TPMCommand):
             "create": tpm_commands_pb2.tpm__commands_dot_tpm__create__pb2.TPMCreate(  # type: ignore
                 header=self._proto_header(),
                 parent_handle=parent_handle,
+                sessions=sessions,
                 in_sensitive=self._proto_sensitive_create(in_sensitive),
                 in_public=self._proto_public(in_public),
                 outside_info=self._proto_tpm2b_data(outside_info[2:]),
@@ -1431,7 +1435,7 @@ class TPMLoad(TPMCommand):
                 session_handle=session_handle_val,
                 nonce_size=0,
                 nonce=b"",
-                session_attributes=0,
+                session_attributes=1,
                 hmac_size=0,
                 hmac=b"",
             )
@@ -1626,7 +1630,7 @@ class TPMPCREvent(TPMCommand):
                 session_handle=session_handle,
                 nonce_size=0,
                 nonce=b"",
-                session_attributes=0,
+                session_attributes=1,
                 hmac_size=0,
                 hmac=b"",
             )
@@ -1678,7 +1682,7 @@ class TPMPCRSetAuthPolicy(TPMCommand):
                 session_handle=session_handle,
                 nonce_size=0,
                 nonce=b"",
-                session_attributes=0,
+                session_attributes=1,
                 hmac_size=0,
                 hmac=b"",
             )
@@ -1711,3 +1715,488 @@ class TPMPCRSetAuthPolicy(TPMCommand):
 
     def to_proto(self) -> Optional[dict]:
         return {"pcrsetauthpolicy": self.proto}
+
+
+# ── HMAC & Sequence Commands (Byte Fuzzer) ────────────────────────────────────
+
+
+class TPMMAC(TPMCommand):
+    """
+    TPM2_MAC (TPM2_HMAC) — compute HMAC/CMAC over a buffer using a loaded key.
+    Wire layout (TPM_ST_SESSIONS, CC = 0x00000155):
+      handle(4) | authArea | buffer: TPM2B_MAX_BUFFER | inScheme: TPMI_ALG_MAC_SCHEME(2)
+    """
+
+    def __init__(
+        self,
+        handle: int,
+        buffer: bytes,
+        in_scheme: Union[int, TPM_ALG] = TPM_ALG.SHA256,
+        session_handle: Union[int, TPM_RS] = TPM_RS.PW,
+        continue_session: int = 1,
+    ):
+        sh_val = (
+            session_handle.value
+            if isinstance(session_handle, TPM_RS)
+            else int(session_handle)
+        )
+        auth = TPMS_AUTH_COMMAND(
+            session_handle=sh_val, session_attributes=continue_session
+        )
+        auth_area = TPM_AUTH_AREA(commands=[auth])
+        buf_2b = len(buffer).to_bytes(2, BYTE_ORDER) + buffer
+        scheme_bytes = alg_to_int(in_scheme).to_bytes(2, BYTE_ORDER)
+        params = (
+            handle.to_bytes(4, BYTE_ORDER)
+            + auth_area.to_bytes()
+            + buf_2b
+            + scheme_bytes
+        )
+        super().__init__(TPM_ST.TPM_ST_SESSIONS, 0x00000155, params=params)
+
+
+class TPMMACStart(TPMCommand):
+    """
+    TPM2_MAC_Start (TPM2_HMAC_Start) — initialize an HMAC sequence object.
+    Wire layout (TPM_ST_SESSIONS, CC = 0x0000015B):
+      handle(4) | authArea | auth: TPM2B_AUTH | inScheme: TPMI_ALG_MAC_SCHEME(2)
+    """
+
+    def __init__(
+        self,
+        handle: int,
+        in_scheme: Union[int, TPM_ALG] = TPM_ALG.SHA256,
+        seq_auth: bytes = b"",
+        session_handle: Union[int, TPM_RS] = TPM_RS.PW,
+        continue_session: int = 1,
+    ):
+        sh_val = (
+            session_handle.value
+            if isinstance(session_handle, TPM_RS)
+            else int(session_handle)
+        )
+        auth = TPMS_AUTH_COMMAND(
+            session_handle=sh_val, session_attributes=continue_session
+        )
+        auth_area = TPM_AUTH_AREA(commands=[auth])
+        seq_auth_2b = len(seq_auth).to_bytes(2, BYTE_ORDER) + seq_auth
+        scheme_bytes = alg_to_int(in_scheme).to_bytes(2, BYTE_ORDER)
+        params = (
+            handle.to_bytes(4, BYTE_ORDER)
+            + auth_area.to_bytes()
+            + seq_auth_2b
+            + scheme_bytes
+        )
+        super().__init__(TPM_ST.TPM_ST_SESSIONS, 0x0000015B, params=params)
+
+
+class TPMHashSequenceStart(TPMCommand):
+    """
+    TPM2_HashSequenceStart — start a hash or event sequence object.
+    Wire layout (TPM_ST_NO_SESSIONS, CC = 0x00000186):
+      auth: TPM2B_AUTH | hashAlg: TPMI_ALG_HASH(2)
+    """
+
+    def __init__(
+        self,
+        hash_alg: Union[int, TPM_ALG] = TPM_ALG.SHA256,
+        seq_auth: bytes = b"",
+    ):
+        seq_auth_2b = len(seq_auth).to_bytes(2, BYTE_ORDER) + seq_auth
+        alg_bytes = alg_to_int(hash_alg).to_bytes(2, BYTE_ORDER)
+        super().__init__(
+            TPM_ST.TPM_ST_NO_SESSIONS, 0x00000186, params=seq_auth_2b + alg_bytes
+        )
+
+
+class TPMSequenceUpdate(TPMCommand):
+    """
+    TPM2_SequenceUpdate — add data to a hash, event, or HMAC sequence object.
+    Wire layout (TPM_ST_SESSIONS, CC = 0x0000015C):
+      sequenceHandle(4) | authArea | buffer: TPM2B_MAX_BUFFER
+    """
+
+    def __init__(
+        self,
+        sequence_handle: int,
+        buffer: bytes,
+        session_handle: Union[int, TPM_RS] = TPM_RS.PW,
+        continue_session: int = 1,
+    ):
+        sh_val = (
+            session_handle.value
+            if isinstance(session_handle, TPM_RS)
+            else int(session_handle)
+        )
+        auth = TPMS_AUTH_COMMAND(
+            session_handle=sh_val, session_attributes=continue_session
+        )
+        auth_area = TPM_AUTH_AREA(commands=[auth])
+        buf_2b = len(buffer).to_bytes(2, BYTE_ORDER) + buffer
+        params = (
+            sequence_handle.to_bytes(4, BYTE_ORDER) + auth_area.to_bytes() + buf_2b
+        )
+        super().__init__(TPM_ST.TPM_ST_SESSIONS, 0x0000015C, params=params)
+
+
+class TPMSequenceComplete(TPMCommand):
+    """
+    TPM2_SequenceComplete — finalize a hash or HMAC sequence and flush the object.
+    Wire layout (TPM_ST_SESSIONS, CC = 0x0000013E):
+      sequenceHandle(4) | authArea | buffer: TPM2B_MAX_BUFFER | hierarchy: TPMI_RH_HIERARCHY(4)
+    """
+
+    def __init__(
+        self,
+        sequence_handle: int,
+        buffer: bytes = b"",
+        hierarchy: Union[int, TPM_RH] = TPM_RH.NULL,
+        session_handle: Union[int, TPM_RS] = TPM_RS.PW,
+        continue_session: int = 1,
+    ):
+        sh_val = (
+            session_handle.value
+            if isinstance(session_handle, TPM_RS)
+            else int(session_handle)
+        )
+        hier_val = hierarchy.value if isinstance(hierarchy, TPM_RH) else int(hierarchy)
+        auth = TPMS_AUTH_COMMAND(
+            session_handle=sh_val, session_attributes=continue_session
+        )
+        auth_area = TPM_AUTH_AREA(commands=[auth])
+        buf_2b = len(buffer).to_bytes(2, BYTE_ORDER) + buffer
+        params = (
+            sequence_handle.to_bytes(4, BYTE_ORDER)
+            + auth_area.to_bytes()
+            + buf_2b
+            + hier_val.to_bytes(4, BYTE_ORDER)
+        )
+        super().__init__(TPM_ST.TPM_ST_SESSIONS, 0x0000013E, params=params)
+
+
+class TPMEventSequenceComplete(TPMCommand):
+    """
+    TPM2_EventSequenceComplete — complete an event sequence and extend PCR.
+    Wire layout (TPM_ST_SESSIONS, CC = 0x00000185):
+      pcrHandle(4) | sequenceHandle(4) | authArea (2 entries) | buffer: TPM2B_MAX_BUFFER
+    """
+
+    def __init__(
+        self,
+        pcr_handle: int,
+        sequence_handle: int,
+        buffer: bytes = b"",
+        pcr_session: Union[int, TPM_RS] = TPM_RS.PW,
+        seq_session: Union[int, TPM_RS] = TPM_RS.PW,
+    ):
+        s1 = (
+            pcr_session.value
+            if isinstance(pcr_session, TPM_RS)
+            else int(pcr_session)
+        )
+        s2 = (
+            seq_session.value
+            if isinstance(seq_session, TPM_RS)
+            else int(seq_session)
+        )
+        auth_area = TPM_AUTH_AREA(
+            commands=[
+                TPMS_AUTH_COMMAND(session_handle=s1, session_attributes=1),
+                TPMS_AUTH_COMMAND(session_handle=s2, session_attributes=1),
+            ]
+        )
+        buf_2b = len(buffer).to_bytes(2, BYTE_ORDER) + buffer
+        params = (
+            pcr_handle.to_bytes(4, BYTE_ORDER)
+            + sequence_handle.to_bytes(4, BYTE_ORDER)
+            + auth_area.to_bytes()
+            + buf_2b
+        )
+        super().__init__(TPM_ST.TPM_ST_SESSIONS, 0x00000185, params=params)
+
+
+# ── Enhanced Authorization (Policy) Session Commands (Byte Fuzzer) ────────────
+
+
+class TPMPolicyCommandCode(TPMCommand):
+    """TPM2_PolicyCommandCode (CC = 0x0000016C, TPM_ST_NO_SESSIONS)"""
+
+    def __init__(self, policy_session: int, code: int):
+        params = policy_session.to_bytes(4, BYTE_ORDER) + code.to_bytes(4, BYTE_ORDER)
+        super().__init__(TPM_ST.TPM_ST_NO_SESSIONS, 0x0000016C, params=params)
+
+
+class TPMPolicyLocality(TPMCommand):
+    """TPM2_PolicyLocality (CC = 0x0000016F, TPM_ST_NO_SESSIONS)"""
+
+    def __init__(self, policy_session: int, locality: int = 0x01):
+        params = policy_session.to_bytes(4, BYTE_ORDER) + locality.to_bytes(
+            1, BYTE_ORDER
+        )
+        super().__init__(TPM_ST.TPM_ST_NO_SESSIONS, 0x0000016F, params=params)
+
+
+class TPMPolicyPassword(TPMCommand):
+    """TPM2_PolicyPassword (CC = 0x0000018C, TPM_ST_NO_SESSIONS)"""
+
+    def __init__(self, policy_session: int):
+        params = policy_session.to_bytes(4, BYTE_ORDER)
+        super().__init__(TPM_ST.TPM_ST_NO_SESSIONS, 0x0000018C, params=params)
+
+
+class TPMPolicyAuthValue(TPMCommand):
+    """TPM2_PolicyAuthValue (CC = 0x0000016B, TPM_ST_NO_SESSIONS)"""
+
+    def __init__(self, policy_session: int):
+        params = policy_session.to_bytes(4, BYTE_ORDER)
+        super().__init__(TPM_ST.TPM_ST_NO_SESSIONS, 0x0000016B, params=params)
+
+
+class TPMPolicyGetDigest(TPMCommand):
+    """TPM2_PolicyGetDigest (CC = 0x00000189, TPM_ST_NO_SESSIONS)"""
+
+    def __init__(self, policy_session: int):
+        params = policy_session.to_bytes(4, BYTE_ORDER)
+        super().__init__(TPM_ST.TPM_ST_NO_SESSIONS, 0x00000189, params=params)
+
+
+class TPMPolicyRestart(TPMCommand):
+    """TPM2_PolicyRestart (CC = 0x00000180, TPM_ST_NO_SESSIONS)"""
+
+    def __init__(self, session_handle: int):
+        params = session_handle.to_bytes(4, BYTE_ORDER)
+        super().__init__(TPM_ST.TPM_ST_NO_SESSIONS, 0x00000180, params=params)
+
+
+class TPMPolicyPCR(TPMCommand):
+    """TPM2_PolicyPCR (CC = 0x0000017F, TPM_ST_NO_SESSIONS)"""
+
+    def __init__(
+        self,
+        policy_session: int,
+        pcrs: TPML_PCR_SELECTION,
+        pcr_digest: bytes = b"",
+    ):
+        digest_2b = len(pcr_digest).to_bytes(2, BYTE_ORDER) + pcr_digest
+        params = (
+            policy_session.to_bytes(4, BYTE_ORDER) + digest_2b + pcrs.to_bytes()
+        )
+        super().__init__(TPM_ST.TPM_ST_NO_SESSIONS, 0x0000017F, params=params)
+
+
+class TPMPolicyOR(TPMCommand):
+    """TPM2_PolicyOR (CC = 0x00000171, TPM_ST_NO_SESSIONS)"""
+
+    def __init__(self, policy_session: int, digests: List[bytes]):
+        count = len(digests).to_bytes(4, BYTE_ORDER)
+        body = b"".join(len(d).to_bytes(2, BYTE_ORDER) + d for d in digests)
+        params = policy_session.to_bytes(4, BYTE_ORDER) + count + body
+        super().__init__(TPM_ST.TPM_ST_NO_SESSIONS, 0x00000171, params=params)
+
+
+class TPMPolicyCpHash(TPMCommand):
+    """TPM2_PolicyCpHash (CC = 0x0000016E, TPM_ST_NO_SESSIONS)"""
+
+    def __init__(self, policy_session: int, cp_hash_a: bytes):
+        digest_2b = len(cp_hash_a).to_bytes(2, BYTE_ORDER) + cp_hash_a
+        params = policy_session.to_bytes(4, BYTE_ORDER) + digest_2b
+        super().__init__(TPM_ST.TPM_ST_NO_SESSIONS, 0x0000016E, params=params)
+
+
+class TPMPolicyNameHash(TPMCommand):
+    """TPM2_PolicyNameHash (CC = 0x00000170, TPM_ST_NO_SESSIONS)"""
+
+    def __init__(self, policy_session: int, name_hash: bytes):
+        digest_2b = len(name_hash).to_bytes(2, BYTE_ORDER) + name_hash
+        params = policy_session.to_bytes(4, BYTE_ORDER) + digest_2b
+        super().__init__(TPM_ST.TPM_ST_NO_SESSIONS, 0x00000170, params=params)
+
+
+class TPMPolicyNvWritten(TPMCommand):
+    """TPM2_PolicyNvWritten (CC = 0x0000018F, TPM_ST_NO_SESSIONS)"""
+
+    def __init__(self, policy_session: int, written_set: int = 1):
+        params = policy_session.to_bytes(4, BYTE_ORDER) + written_set.to_bytes(
+            1, BYTE_ORDER
+        )
+        super().__init__(TPM_ST.TPM_ST_NO_SESSIONS, 0x0000018F, params=params)
+
+
+class TPMPolicySecret(TPMCommand):
+    """TPM2_PolicySecret (CC = 0x00000151, TPM_ST_SESSIONS)"""
+
+    def __init__(
+        self,
+        auth_handle: Union[int, TPM_RH],
+        policy_session: int,
+        nonce_tpm: bytes = b"",
+        cp_hash_a: bytes = b"",
+        policy_ref: bytes = b"",
+        expiration: int = 0,
+        session_handle: Union[int, TPM_RS] = TPM_RS.PW,
+    ):
+        ah = auth_handle.value if isinstance(auth_handle, TPM_RH) else int(auth_handle)
+        sh = (
+            session_handle.value
+            if isinstance(session_handle, TPM_RS)
+            else int(session_handle)
+        )
+        auth_area = TPM_AUTH_AREA(commands=[TPMS_AUTH_COMMAND(session_handle=sh)])
+        params = (
+            ah.to_bytes(4, BYTE_ORDER)
+            + policy_session.to_bytes(4, BYTE_ORDER)
+            + auth_area.to_bytes()
+            + len(nonce_tpm).to_bytes(2, BYTE_ORDER)
+            + nonce_tpm
+            + len(cp_hash_a).to_bytes(2, BYTE_ORDER)
+            + cp_hash_a
+            + len(policy_ref).to_bytes(2, BYTE_ORDER)
+            + policy_ref
+            + expiration.to_bytes(4, BYTE_ORDER, signed=True)
+        )
+        super().__init__(TPM_ST.TPM_ST_SESSIONS, 0x00000151, params=params)
+
+
+# ── Context, Object, Symmetric & Attestation Commands (Byte Fuzzer) ───────────
+
+
+class TPMFlushContext(TPMCommand):
+    """TPM2_FlushContext (CC = 0x00000165, TPM_ST_NO_SESSIONS)"""
+
+    def __init__(self, flush_handle: int):
+        super().__init__(
+            TPM_ST.TPM_ST_NO_SESSIONS,
+            0x00000165,
+            params=flush_handle.to_bytes(4, BYTE_ORDER),
+        )
+
+
+class TPMContextSave(TPMCommand):
+    """TPM2_ContextSave (CC = 0x00000162, TPM_ST_NO_SESSIONS)"""
+
+    def __init__(self, save_handle: int):
+        super().__init__(
+            TPM_ST.TPM_ST_NO_SESSIONS,
+            0x00000162,
+            params=save_handle.to_bytes(4, BYTE_ORDER),
+        )
+
+
+class TPMReadPublic(TPMCommand):
+    """TPM2_ReadPublic (CC = 0x00000173, TPM_ST_NO_SESSIONS)"""
+
+    def __init__(self, object_handle: int):
+        super().__init__(
+            TPM_ST.TPM_ST_NO_SESSIONS,
+            0x00000173,
+            params=object_handle.to_bytes(4, BYTE_ORDER),
+        )
+
+
+class TPMEncryptDecrypt2(TPMCommand):
+    """
+    TPM2_EncryptDecrypt2 (CC = 0x00000193, TPM_ST_SESSIONS):
+      keyHandle(4) | authArea | inData(TPM2B) | decrypt(1) | mode(2) | ivIn(TPM2B)
+    """
+
+    def __init__(
+        self,
+        key_handle: int,
+        in_data: bytes,
+        decrypt: int = 0,
+        mode: Union[int, TPM_ALG] = TPM_ALG.NULL,
+        iv_in: bytes = b"\x00" * 16,
+        session_handle: Union[int, TPM_RS] = TPM_RS.PW,
+    ):
+        sh = (
+            session_handle.value
+            if isinstance(session_handle, TPM_RS)
+            else int(session_handle)
+        )
+        auth_area = TPM_AUTH_AREA(commands=[TPMS_AUTH_COMMAND(session_handle=sh)])
+        params = (
+            key_handle.to_bytes(4, BYTE_ORDER)
+            + auth_area.to_bytes()
+            + len(in_data).to_bytes(2, BYTE_ORDER)
+            + in_data
+            + decrypt.to_bytes(1, BYTE_ORDER)
+            + alg_to_int(mode).to_bytes(2, BYTE_ORDER)
+            + len(iv_in).to_bytes(2, BYTE_ORDER)
+            + iv_in
+        )
+        super().__init__(TPM_ST.TPM_ST_SESSIONS, 0x00000193, params=params)
+
+
+class TPMQuote(TPMCommand):
+    """
+    TPM2_Quote (CC = 0x00000158, TPM_ST_SESSIONS):
+      signHandle(4) | authArea | qualifyingData(TPM2B) | inScheme(TPMT_SIG_SCHEME) | PCRselect(TPML_PCR_SELECTION)
+    """
+
+    def __init__(
+        self,
+        sign_handle: int,
+        qualifying_data: bytes,
+        in_scheme: TPMT_SIG_SCHEME,
+        pcr_select: TPML_PCR_SELECTION,
+        session_handle: Union[int, TPM_RS] = TPM_RS.PW,
+    ):
+        sh = (
+            session_handle.value
+            if isinstance(session_handle, TPM_RS)
+            else int(session_handle)
+        )
+        auth_area = TPM_AUTH_AREA(commands=[TPMS_AUTH_COMMAND(session_handle=sh)])
+        params = (
+            sign_handle.to_bytes(4, BYTE_ORDER)
+            + auth_area.to_bytes()
+            + len(qualifying_data).to_bytes(2, BYTE_ORDER)
+            + qualifying_data
+            + in_scheme.to_bytes()
+            + pcr_select.to_bytes()
+        )
+        super().__init__(TPM_ST.TPM_ST_SESSIONS, 0x00000158, params=params)
+
+
+class TPMDictionaryAttackLockReset(TPMCommand):
+    """TPM2_DictionaryAttackLockReset (CC = 0x00000139, TPM_ST_SESSIONS)"""
+
+    def __init__(
+        self,
+        lock_handle: Union[int, TPM_RH] = TPM_RH.LOCKOUT,
+        session_handle: Union[int, TPM_RS] = TPM_RS.PW,
+    ):
+        lh = lock_handle.value if isinstance(lock_handle, TPM_RH) else int(lock_handle)
+        sh = (
+            session_handle.value
+            if isinstance(session_handle, TPM_RS)
+            else int(session_handle)
+        )
+        auth_area = TPM_AUTH_AREA(commands=[TPMS_AUTH_COMMAND(session_handle=sh)])
+        params = lh.to_bytes(4, BYTE_ORDER) + auth_area.to_bytes()
+        super().__init__(TPM_ST.TPM_ST_SESSIONS, 0x00000139, params=params)
+
+
+class TPMPCRSetAuthValue(TPMCommand):
+    """TPM2_PCR_SetAuthValue (CC = 0x00000183, TPM_ST_SESSIONS)"""
+
+    def __init__(
+        self,
+        pcr_handle: int,
+        auth: bytes,
+        session_handle: Union[int, TPM_RS] = TPM_RS.PW,
+    ):
+        sh = (
+            session_handle.value
+            if isinstance(session_handle, TPM_RS)
+            else int(session_handle)
+        )
+        auth_area = TPM_AUTH_AREA(commands=[TPMS_AUTH_COMMAND(session_handle=sh)])
+        params = (
+            pcr_handle.to_bytes(4, BYTE_ORDER)
+            + auth_area.to_bytes()
+            + len(auth).to_bytes(2, BYTE_ORDER)
+            + auth
+        )
+        super().__init__(TPM_ST.TPM_ST_SESSIONS, 0x00000183, params=params)
+

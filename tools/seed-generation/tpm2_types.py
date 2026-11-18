@@ -57,15 +57,22 @@ class TPM_ALG(Enum):
     RSA = 0x0001
     HMAC = 0x0005
     SHA1 = 0x0004
+    AES = 0x0006
+    KEYEDHASH = 0x0008
+    XOR = 0x000A
     SHA256 = 0x000B
     SHA384 = 0x000C
-    AES = 0x0006
-    CFB = 0x0043
+    SHA512 = 0x000D
     NULL = 0x0010
+    SM3_256 = 0x0012
     RSASSA = 0x0014
     RSAES = 0x0015
     OAEP = 0x0017
-    KEYEDHASH = 0x0008
+    CTR = 0x0040
+    OFB = 0x0041
+    CBC = 0x0042
+    CFB = 0x0043
+    ECB = 0x0044
 
 
 class TPMA_OBJECT(Enum):
@@ -331,7 +338,7 @@ class TPMS_AUTH_COMMAND:
 
     session_handle: int  # TPMI_SH_AUTH_SESSION
     nonce: bytes = b""  # TPM2B_NONCE (data)
-    session_attributes: int = 0  # TPMA_SESSION (1 byte bitfield)
+    session_attributes: int = 1  # TPMA_SESSION (bit 0 = continueSession)
     hmac: bytes = b""  # TPM2B_AUTH (data)
 
     def to_bytes(self) -> bytes:
