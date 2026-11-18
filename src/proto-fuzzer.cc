@@ -48,8 +48,8 @@ DEFINE_PROTO_FUZZER(const tpm::TPMCommandSequence& sequence) {
     size_t cmd_size = command_buffer.size();
     // Reserve extra space for the HMAC bytes added by SessionAuthPatchCommand.
     // Commands without a session are left untouched, so this resize is safe.
-    if (command_buffer.size() < cmd_size + 64) {
-      command_buffer.resize(cmd_size + 64);
+    if (command_buffer.size() < cmd_size + 128) {
+      command_buffer.resize(cmd_size + 128);
     }
     cmd_size = SessionAuthPatchCommand(command_buffer.data(), cmd_size,
                                        command_buffer.size());

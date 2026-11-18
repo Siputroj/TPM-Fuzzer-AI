@@ -36,7 +36,7 @@ void SetHmacSession(tpm_types::TPMSession* session, char nonce_fill) {
   session->set_session_handle(kFirstHmacSessionHandle);
   session->set_nonce(std::string(16, nonce_fill));
   session->set_nonce_size(16);
-  session->set_session_attributes(0);
+  session->set_session_attributes(1);
   session->set_hmac("");
   session->set_hmac_size(0);
 }
@@ -109,6 +109,10 @@ void NormalizeCreatePrimary(tpm_commands::TPMCreatePrimary* msg) {
   if (msg->hierarchy() == constants::TPM_RH_UNSPECIFIED)
     msg->set_hierarchy(constants::TPM_RH_OWNER);
 
+  if (msg->sessions().empty()) {
+    SetPasswordSession(msg->add_sessions());
+  }
+
   NormalizeRsaOrKeyedHashPublic(msg->mutable_in_public()->mutable_public_area(),
                                 kStorageParentObjectAttributes);
 }
@@ -121,6 +125,10 @@ void NormalizeCreate(tpm_commands::TPMCreate* msg) {
     msg->set_parent_handle(kFirstTransientObjectHandle);
   }
 
+  if (msg->sessions().empty()) {
+    SetPasswordSession(msg->add_sessions());
+  }
+
   NormalizeRsaOrKeyedHashPublic(msg->mutable_in_public()->mutable_public_area(),
                                 kChildObjectAttributes);
 }
@@ -128,6 +136,10 @@ void NormalizeCreate(tpm_commands::TPMCreate* msg) {
 void NormalizeRSADecrypt(tpm_commands::TPMRSADecrypt* msg) {
   msg->mutable_header()->set_tag(constants::TPM_ST_SESSIONS);
   msg->mutable_header()->set_command_code(constants::TPM_CC_RSA_DECRYPT);
+
+  if (msg->sessions().empty()) {
+    SetPasswordSession(msg->add_sessions());
+  }
 }
 
 void NormalizeClear(tpm_commands::TPMClear* msg) {

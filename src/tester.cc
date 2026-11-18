@@ -5,6 +5,7 @@
 #include <print>
 #include <vector>
 
+#include "harness/session_auth.h"
 #include "harness/tpm_wrapper.h"
 #include "parser/byte_parser.h"
 
@@ -107,6 +108,7 @@ int main(int argc, char* argv[]) {
   TPMManufactureIfNeeded();
   TPMStartup();
   SendTPM2StartupCommand();
+  SessionAuthReset();
 
   // Send all parsed commands and print their responses.
   for (auto command : commands) {
@@ -172,6 +174,14 @@ void ReadCorpus(char* path, std::vector<char>& buffer, size_t& length) {
 }
 
 std::vector<uint8_t> SendCommand(std::vector<uint8_t> command) {
+  if (!command.empty()) {
+    const size_t orig_size = command.size();
+    command.resize(orig_size + 128);
+    const size_t patched_size =
+        SessionAuthPatchCommand(command.data(), orig_size, command.size());
+    command.resize(patched_size);
+  }
+
   std::println("==============================");
   std::println("            REQUEST           ");
   std::println("==============================");
@@ -258,6 +268,7 @@ std::vector<uint8_t> SendCommand(std::vector<uint8_t> command) {
   response.buffer_size = out.size();
 
   TPMSendCommand(kDefaultLocality, request, &response);
+  SessionAuthProcessResponse(response.buffer, response.buffer_size);
   out.resize(response.buffer_size);
   return out;
 }

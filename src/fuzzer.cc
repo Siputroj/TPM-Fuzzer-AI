@@ -14,6 +14,7 @@
 #include <vector>
 
 extern "C" {
+#include <harness/session_auth.h>
 #include <harness/tpm_wrapper.h>
 }
 
@@ -27,11 +28,18 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
   TPMManufactureIfNeeded();
   TPMStartup();
   SendTPM2StartupCommand();
+  SessionAuthReset();
 
   for (auto& cmd : commands) {
+    size_t cmd_size = cmd.size();
+    if (cmd.size() < cmd_size + 128) {
+      cmd.resize(cmd_size + 128);
+    }
+    cmd_size = SessionAuthPatchCommand(cmd.data(), cmd_size, cmd.size());
+
     struct InBuffer request;
     request.buffer = cmd.data();
-    request.buffer_size = cmd.size();
+    request.buffer_size = cmd_size;
 
     char OutputBuffer[kMaxBuffers];
     struct OutBuffer response;
@@ -39,6 +47,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
     response.buffer_size = kMaxBuffers;
 
     TPMSendCommand(kDefaultLocality, request, &response);
+    SessionAuthProcessResponse(response.buffer, response.buffer_size);
   }
 
   SendTPM2ShutdownCommand();
