@@ -1,0 +1,60 @@
+commands {
+  startauthsession {
+    header {
+      tag: TPM_ST_NO_SESSIONS
+      command_size: 43
+      command_code: TPM_CC_START_AUTH_SESSION
+    }
+    tpm_key: TPM_RH_NULL
+    bind: TPM_RH_NULL
+    nonce {
+      size: 16
+      buffer: "\366\\\325\177\031\377\331\310\311Ad\254\204\321\371\315"
+    }
+    encrypted_salt {
+    }
+    symmetric {
+      algorithm: TPM_ALG_NULL
+      mode: TPM_ALG_NULL
+    }
+    auth_hash: TPM_ALG_SHA256
+  }
+}
+commands {
+  pcrevent {
+    header {
+      tag: TPM_ST_SESSIONS
+      command_size: 47
+      command_code: TPM_CC_PCR_EVENT
+    }
+    sessions {
+      session_handle: 33554432
+      session_attributes: 1
+    }
+    eventData {
+      size: 18
+      buffer: "hmac event payload"
+    }
+  }
+}
+commands {
+  pcrallocate {
+    header {
+      tag: TPM_ST_SESSIONS
+      command_size: 37
+      command_code: TPM_CC_PCR_ALLOCATE
+    }
+    auth_handle: TPM_RH_PLATFORM
+    sessions {
+      session_handle: 33554432
+    }
+    pcr_allocation {
+      count: 1
+      pcr_selections {
+        hash: TPM_ALG_SHA256
+        sizeof_select: 3
+        pcr_select: "\001\000\002"
+      }
+    }
+  }
+}
