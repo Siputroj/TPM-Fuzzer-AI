@@ -29,6 +29,7 @@ struct CallTracker {
   bool clear_nv_avail_called = false;
   bool signal_power_off_called = false;
   bool tpm_teardown_called = false;
+  bool nv_disable_delete_before_power_off = false;
 
   void reset() { *this = CallTracker(); }
 };
@@ -57,9 +58,17 @@ int TPM_Manufacture(int firstTime) {
 }
 
 void _plat__NVDisable(void* shouldSave, int size) {
-  (void)shouldSave;
   (void)size;
   MockTPM::tracker.nv_disable_called = true;
+  if (reinterpret_cast<intptr_t>(shouldSave) != 0 &&
+      !MockTPM::tracker.signal_power_off_called) {
+    MockTPM::tracker.nv_disable_delete_before_power_off = true;
+  }
+}
+
+int TPM_TearDown(void) {
+  MockTPM::tracker.tpm_teardown_called = true;
+  return 0;
 }
 
 // TPMStartup mocks
@@ -252,6 +261,7 @@ TEST_CASE("TPMShutdown - calls all cleanup functions",
   REQUIRE(MockTPM::tracker.clear_nv_avail_called == true);
   REQUIRE(MockTPM::tracker.signal_power_off_called == true);
   REQUIRE(MockTPM::tracker.nv_disable_called == true);
+  REQUIRE(MockTPM::tracker.tpm_teardown_called == true);
 }
 
 TEST_CASE("TPMShutdown - cleanup functions called in correct order",
@@ -260,10 +270,13 @@ TEST_CASE("TPMShutdown - cleanup functions called in correct order",
 
   TPMShutdown();
 
-  // Verify all cleanup operations were performed
+  // Verify all cleanup operations were performed and NV delete happened before
+  // _plat__Signal_PowerOff closes s_NvFile.
   REQUIRE(MockTPM::tracker.hash_end_called == true);
   REQUIRE(MockTPM::tracker.nv_commit_called == true);
   REQUIRE(MockTPM::tracker.clear_nv_avail_called == true);
+  REQUIRE(MockTPM::tracker.nv_disable_delete_before_power_off == true);
+  REQUIRE(MockTPM::tracker.tpm_teardown_called == true);
   REQUIRE(MockTPM::tracker.signal_power_off_called == true);
   REQUIRE(MockTPM::tracker.nv_disable_called == true);
 }

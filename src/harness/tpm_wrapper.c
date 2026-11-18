@@ -95,10 +95,12 @@ void TPMShutdown(void) {
   _plat__NvCommit();
   _plat__ClearNvAvail();
 
-  _plat__Signal_PowerOff();
-
   // Actual reference implementation doesn't remove the NVChip.
-  // We want it gone for a fresh start each run.
-  // _plat__TearDown();
+  // Truncate NVChip while s_NvFile is still open (before _plat__Signal_PowerOff
+  // closes it with delete=FALSE), and reset g_manufactured via TPM_TearDown()
+  // for a fresh, deterministic start on each fuzzing iteration.
   _plat__NVDisable((void*)1, 0);
+  TPM_TearDown();
+
+  _plat__Signal_PowerOff();
 }
